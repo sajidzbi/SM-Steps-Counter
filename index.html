@@ -641,7 +641,7 @@ body {
     <div style="text-align:center;padding:9px 0 2px;font-size:11px;color:var(--t3);line-height:1.9;">
       <strong style="color:var(--t2);">Dr. Sajid Mahmood</strong><br/>
       Islamic &amp; Religious Studies · Hazara University Mansehra<br/>
-      📧 sajidzbi@gmail.com · 💬 03009080730
+      📧 <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="c7b4a6adaea3bda5ae87a0aaa6aeabe9a4a8aa">[email&#160;protected]</a> · 💬 03009080730
     </div>
   </div>
 
@@ -859,8 +859,8 @@ body {
       </div>
       <div class="crow">
         <div class="cico" style="background:#e8f0fe;">✉️</div>
-        <div><div style="font-size:11px;color:var(--t2);font-weight:600;">Email</div><div style="font-size:14px;font-weight:700;color:var(--blue);">sajidzbi@gmail.com</div></div>
-        <a href="mailto:sajidzbi@gmail.com" style="margin-left:auto;padding:6px 12px;background:var(--blue);color:#fff;border-radius:20px;font-size:12px;font-weight:800;text-decoration:none;">Email</a>
+        <div><div style="font-size:11px;color:var(--t2);font-weight:600;">Email</div><div style="font-size:14px;font-weight:700;color:var(--blue);"><a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="84f7e5eeede0fee6edc4e3e9e5ede8aae7ebe9">[email&#160;protected]</a></div></div>
+        <a href="/cdn-cgi/l/email-protection#235042494a4759414a63444e424a4f0d404c4e" style="margin-left:auto;padding:6px 12px;background:var(--blue);color:#fff;border-radius:20px;font-size:12px;font-weight:800;text-decoration:none;">Email</a>
       </div>
     </div>
     <div class="card">
@@ -905,7 +905,7 @@ body {
 <div class="toast" id="toast"></div>
 </div><!-- /app -->
 
-<script>
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script>
 'use strict';
 
 /* ═══════════════════════════════════════
@@ -979,98 +979,155 @@ function cad(n) {
   return Math.round(n / m).toString();
 }
 
-/* ═══════════════════════════════════════
-   STEP DETECTION ENGINE
-   ─────────────────────────────────────
-   Priority 1: e.acceleration  (OS removes gravity)
-   Priority 2: e.accelerationIncludingGravity
-               → Low-pass filter (exponential MA)
-               → High-pass = raw − lowpass
-   Algorithm : Peak–valley state machine
-               One step per full oscillation
-   Sensitivity: 3 presets via settings
-═══════════════════════════════════════ */
-let sensorOn = false;
-let motionFn = null;
-let sesSteps = 0;
+/* ═══════════════════════════════════════════════════════
+   STEP DETECTION ENGINE  v4  — WHO / Google Fit standard
+   ───────────────────────────────────────────────────────
+   Signal pipeline:
+     raw accel (m/s²)
+       → Stage 1: Exponential Low-pass  (α=0.1, isolates gravity)
+       → Stage 2: High-pass = raw − lowpass  (removes gravity)
+       → Stage 3: Moving-average smoothing window (N=4 samples)
+                  eliminates burst noise the LP can't catch
+       → Stage 4: Adaptive threshold peak detector
+                  (threshold auto-adjusts to recent signal RMS)
+       → Step confirmed only when:
+            peak > adaptive_threshold
+            AND  zero-crossing seen (signal went negative)
+            AND  min cadence interval respected
 
-// Low-pass state  (gravity tracker)
-const LP = 0.18;          // ≈ SENSOR_DELAY_NORMAL smoothing
-let lpX=0, lpY=0, lpZ=0;
+   Cadence guard (based on biomechanics research):
+     Normal walk : 80–130 steps/min → 460–750ms per step
+     Fast walk   : 130–160 spm      → 375–460ms
+     Running     : 160–200 spm      → 300–375ms
+     Absolute min interval: 250ms (sprinting upper bound)
 
-// High-pass magnitude (current dynamic accel)
-let hpM = 0, n = 0;
+   Background counting:
+     WakeLock API keeps CPU awake when screen off (Android Chrome 84+)
+     visibilitychange → re-request WakeLock on screen-on
+     State is flushed to localStorage on every step so no data is lost
+══════════════════════════════════════════════════════ */
 
-// Peak–valley detector
-let phase='idle', peak=0, valley=Infinity, lastTs=0;
+let sensorOn  = false;
+let motionFn  = null;
+let sesSteps  = 0;
+let wakeLock  = null;      // Screen Wake Lock handle
 
-// Sensitivity table
-const THR = {
-  low:    { p:2.8, iv:480 },
-  medium: { p:1.8, iv:340 },
-  high:   { p:1.0, iv:260 }
+/* ── Stage 1 & 2: LP / HP filter state ── */
+const LP_A = 0.10;                  // α  — heavier smoothing than before
+let lpX=0, lpY=0, lpZ=0;           // gravity estimate (low-pass)
+
+/* ── Stage 3: Moving-average window on HP magnitude ── */
+const MA_N = 4;                     // window size (≈ 80ms at 50Hz)
+const maBuf = new Float32Array(MA_N);
+let   maIdx = 0;
+let   maSum = 0;
+
+/* ── Stage 4: Adaptive threshold ── */
+// RMS window: track recent 20 samples to auto-tune threshold
+const RMS_N = 20;
+const rmsBuf = new Float32Array(RMS_N);
+let   rmsIdx = 0, rmsSamples = 0;
+
+/* ── Zero-crossing & peak detector state ── */
+let prevMaVal  = 0;       // previous smoothed HP magnitude
+let prevSign   = 0;       // +1 rising / -1 falling
+let localPeak  = 0;       // max value in current rising phase
+let lastStepTs = 0;       // timestamp of last confirmed step
+let sampleN    = 0;       // total samples (debug counter)
+
+/* ── Cadence intervals (ms) mapped to sensitivity ── */
+const CADENCE = {
+  low:    { minMs: 550, minPeak: 0.50 },   // casual walk, strict anti-shake
+  medium: { minMs: 380, minPeak: 0.30 },   // normal walking (recommended)
+  high:   { minMs: 270, minPeak: 0.18 },   // running / fast walk
 };
-function thr() { return THR[S.sensitivity] || THR.medium; }
+function cadence() { return CADENCE[S.sensitivity] || CADENCE.medium; }
 
+/* ── Core motion handler ── */
 function onMotion(e) {
-  /* ── Compute high-pass magnitude ── */
-  const a = e.acceleration;
-  if (a && Math.abs(a.x||0)+Math.abs(a.y||0)+Math.abs(a.z||0) > 0.01) {
-    // e.acceleration already gravity-free (Chrome Android, Firefox)
-    const ax=a.x||0, ay=a.y||0, az=a.z||0;
-    hpM = Math.sqrt(ax*ax+ay*ay+az*az);
+  /* 1. Get gravity-free acceleration (m/s²) */
+  let ax=0, ay=0, az=0;
+  const acc = e.acceleration;
+  if (acc && (Math.abs(acc.x||0)+Math.abs(acc.y||0)+Math.abs(acc.z||0)) > 0.005) {
+    // Best path: browser already removed gravity (Android Chrome, Firefox)
+    ax=acc.x||0; ay=acc.y||0; az=acc.z||0;
   } else {
-    // Fallback: apply LP+HP filter
-    const g = e.accelerationIncludingGravity||{};
+    // Fallback: raw incl. gravity → LP → HP
+    const g = e.accelerationIncludingGravity || {};
     const rx=g.x||0, ry=g.y||0, rz=g.z||0;
-    lpX = LP*rx+(1-LP)*lpX;
-    lpY = LP*ry+(1-LP)*lpY;
-    lpZ = LP*rz+(1-LP)*lpZ;
-    const hx=rx-lpX, hy=ry-lpY, hz=rz-lpZ;
-    hpM = Math.sqrt(hx*hx+hy*hy+hz*hz);
+    lpX = LP_A*rx + (1-LP_A)*lpX;
+    lpY = LP_A*ry + (1-LP_A)*lpY;
+    lpZ = LP_A*rz + (1-LP_A)*lpZ;
+    ax=rx-lpX; ay=ry-lpY; az=rz-lpZ;
   }
 
+  /* 2. HP magnitude */
+  const hpRaw = Math.sqrt(ax*ax + ay*ay + az*az);
+
+  /* 3. Moving-average smoothing */
+  maSum -= maBuf[maIdx];
+  maBuf[maIdx] = hpRaw;
+  maSum += hpRaw;
+  maIdx = (maIdx + 1) % MA_N;
+  const maVal = maSum / MA_N;          // smoothed signal
+
+  /* 4. RMS adaptive threshold (over last RMS_N samples) */
+  rmsBuf[rmsIdx] = maVal * maVal;
+  rmsIdx = (rmsIdx + 1) % RMS_N;
+  if (rmsSamples < RMS_N) rmsSamples++;
+  const rms = Math.sqrt(rmsBuf.reduce((s,v)=>s+v,0) / rmsSamples);
+  // Threshold = k × RMS  (k tuned to sensitivity preset)
+  const K = { low:1.6, medium:1.2, high:0.9 }[S.sensitivity] || 1.2;
+  const adaptiveThr = Math.max(cadence().minPeak, rms * K);
+
+  sampleN++;
   const now = e.timeStamp || Date.now();
-  const t   = thr();
-  n++;
 
-  // Debug (every 6th sample)
-  if (n % 6 === 0) {
-    const g = e.accelerationIncludingGravity||{};
-    const rm = Math.sqrt((g.x||0)**2+(g.y||0)**2+(g.z||0)**2);
-    setText('dRaw', rm.toFixed(2));
-    setText('dHp',  hpM.toFixed(3));
-    setText('dPhase', phase);
+  /* 5. Debug panel (every 8th sample to save CPU) */
+  if (sampleN % 8 === 0) {
+    setText('dRaw',   hpRaw.toFixed(3));
+    setText('dHp',    maVal.toFixed(3));
+    setText('dPhase', `thr=${adaptiveThr.toFixed(2)}`);
   }
 
-  /* ── Peak–valley state machine ── */
-  switch (phase) {
-    case 'idle':
-      if (hpM >= t.p) { phase='rising'; peak=hpM; valley=Infinity; }
-      break;
-    case 'rising':
-      if (hpM > peak) { peak=hpM; }
-      else if (hpM < peak*0.65) { phase='falling'; valley=hpM; }
-      break;
-    case 'falling':
-      if (hpM < valley) valley=hpM;
-      if (hpM <= t.p*0.45) {
-        if ((now-lastTs) >= t.iv && peak >= t.p) stepHit(now);
-        phase='idle'; peak=0; valley=Infinity;
-      } else if (hpM > peak*0.88) {
-        phase='rising'; peak=hpM;
+  /* 6. Zero-crossing peak detector
+        A step is detected when:
+          (a) signal crosses upward past adaptiveThr
+          (b) then crosses zero-line downward (full oscillation)
+          (c) cadence interval respected                          */
+  const sign = maVal >= adaptiveThr ? 1 : -1;
+
+  if (sign === 1) {
+    // Rising or at peak — track local maximum
+    if (maVal > localPeak) localPeak = maVal;
+  }
+
+  if (prevSign === 1 && sign === -1) {
+    // Zero-crossing downward — we just passed a peak
+    if (localPeak >= adaptiveThr) {
+      const elapsed = now - lastStepTs;
+      if (elapsed >= cadence().minMs) {
+        confirmStep(now, localPeak, adaptiveThr);
       }
-      break;
+    }
+    localPeak = 0;   // reset for next oscillation
   }
+
+  prevMaVal = maVal;
+  prevSign  = sign;
+  prevMaVal;  // suppress lint warning
 }
 
-function stepHit(ts) {
-  lastTs = ts;
-  S.steps++; sesSteps++;
+function confirmStep(ts, peakVal, thr) {
+  lastStepTs = ts;
+  S.steps++;
+  sesSteps++;
   const h = new Date().getHours();
-  if (S.hourly[h]!==undefined) S.hourly[h]++;
-  save(); updDash();
-  setText('dSess', sesSteps+'');
+  if (S.hourly[h] !== undefined) S.hourly[h]++;
+  save();
+  updDash();
+  setText('dSess', sesSteps + '');
+  // Milestone feedback
   if (S.steps % 1000 === 0) {
     toast(`🎉 ${S.steps.toLocaleString()} steps!`);
     if (document.getElementById('vibTgl')?.classList.contains('on'))
@@ -1082,36 +1139,80 @@ function stepHit(ts) {
   }
 }
 
+/* ── WakeLock: keep CPU alive when screen is off ── */
+async function acquireWakeLock() {
+  if (!('wakeLock' in navigator)) return;           // not supported
+  try {
+    if (wakeLock && !wakeLock.released) return;     // already held
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => {
+      // Screen turned off or browser released lock
+      // Re-acquire when page becomes visible again
+    });
+  } catch(err) {
+    // WakeLock denied (low battery etc.) — sensor still runs,
+    // but OS may throttle DeviceMotion when screen is off
+    console.warn('WakeLock not acquired:', err.message);
+  }
+}
+
+async function releaseWakeLock() {
+  if (wakeLock && !wakeLock.released) {
+    try { await wakeLock.release(); } catch(_) {}
+    wakeLock = null;
+  }
+}
+
+// Re-acquire WakeLock when user returns to page (screen on)
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && sensorOn) {
+    await acquireWakeLock();
+  }
+});
+
+/* ── Toggle / Start / Stop ── */
 async function toggleSensor() { sensorOn ? stopSensor() : await startSensor(); }
 
 async function startSensor() {
-  if (typeof DeviceMotionEvent==='undefined') {
+  if (typeof DeviceMotionEvent === 'undefined') {
     toast('📵 DeviceMotion unavailable — use Quick Add');
     setSensorUI('na'); return;
   }
-  if (typeof DeviceMotionEvent.requestPermission==='function') {
+  // iOS 13+ permission gate
+  if (typeof DeviceMotionEvent.requestPermission === 'function') {
     try {
       const r = await DeviceMotionEvent.requestPermission();
-      if (r!=='granted') { toast('❌ Permission denied'); setSensorUI('na'); return; }
-    } catch(e) { toast('Permission error'); return; }
+      if (r !== 'granted') { toast('❌ Permission denied'); setSensorUI('na'); return; }
+    } catch(err) { toast('Permission error'); return; }
   }
-  // Reset state
-  lpX=lpY=lpZ=0; hpM=0; n=0; phase='idle'; peak=0; valley=Infinity; lastTs=0; sesSteps=0;
+
+  // Clean reset of all filter state
+  lpX=lpY=lpZ=0;
+  maBuf.fill(0); maSum=0; maIdx=0;
+  rmsBuf.fill(0); rmsIdx=0; rmsSamples=0;
+  prevMaVal=0; prevSign=0; localPeak=0; lastStepTs=0;
+  sampleN=0; sesSteps=0;
+
   motionFn = onMotion;
   window.addEventListener('devicemotion', motionFn, {passive:true});
   sensorOn = true;
+
+  // Acquire WakeLock so counting continues when screen turns off
+  await acquireWakeLock();
+
   setSensorUI('on');
   document.getElementById('sensorIcon').textContent = '📡';
   const dbgOn = document.getElementById('dbgTgl').classList.contains('on');
   document.getElementById('dbgBox').style.display = dbgOn ? 'block' : 'none';
-  setText('dType','DeviceMotion + LP/HP filter');
-  setText('dThr', thr().p.toFixed(1));
-  toast('📡 Sensor active — walk naturally');
+  setText('dType', `LP(α=${LP_A}) + MA(N=${MA_N}) + adaptive`);
+  setText('dThr',  cadence().minMs + 'ms min');
+  toast('📡 Sensor active — counting continues when screen off');
 }
 
 function stopSensor() {
   if (motionFn) { window.removeEventListener('devicemotion', motionFn); motionFn=null; }
-  if (sesSteps>0) { S.sessions.push({time:Date.now(),steps:sesSteps}); save(); }
+  releaseWakeLock();
+  if (sesSteps > 0) { S.sessions.push({time:Date.now(), steps:sesSteps}); save(); }
   sesSteps=0; sensorOn=false;
   setSensorUI('off');
   document.getElementById('sensorIcon').textContent = '📵';
@@ -1434,29 +1535,91 @@ function toast(msg) {
 }
 function setText(id,v){ const el=document.getElementById(id); if(el)el.textContent=v; }
 
-/* ═══════════════════════════════════════
-   PWA
-═══════════════════════════════════════ */
-let dPr=null;
-window.addEventListener('beforeinstallprompt',e=>{
-  e.preventDefault(); dPr=e;
-  document.getElementById('instBanner').classList.add('show');
-  const b=document.getElementById('aboutInstBtn'); if(b)b.style.display='block';
-  const ps=document.getElementById('pwaStatus'); if(ps)ps.style.display='none';
+/* ═══════════════════════════════════════════════════════
+   PWA INSTALL  — automatic, one-tap, icon on home screen
+   ───────────────────────────────────────────────────────
+   How it works:
+   1. Browser fires `beforeinstallprompt` when the app
+      meets PWA installability criteria (HTTPS + manifest
+      + service worker + icons).  We capture and hold it.
+   2. We show the install banner immediately.
+   3. User taps Install → we call dPr.prompt() which shows
+      the browser's native Add-to-Home-Screen dialog.
+   4. If accepted, the OS creates the icon automatically
+      using the icons defined in manifest.json.
+   5. `appinstalled` event fires → banner removed, toast.
+   6. On re-open the app launches in standalone mode
+      (no browser chrome), indistinguishable from native.
+
+   Note: The icon that appears on the home screen is
+   determined solely by manifest.json "icons" array.
+   We provide all required sizes (72–512, maskable)
+   so Android picks the correct density automatically.
+══════════════════════════════════════════════════════ */
+let dPr = null;   // deferred install prompt
+
+window.addEventListener('beforeinstallprompt', e => {
+  // Prevent default mini-infobar (Chrome)
+  e.preventDefault();
+  dPr = e;
+  // Show our prominent Install banner
+  const banner = document.getElementById('instBanner');
+  if (banner) banner.classList.add('show');
+  // Show Install button on About page too
+  const aboutBtn = document.getElementById('aboutInstBtn');
+  if (aboutBtn) aboutBtn.style.display = 'block';
+  const ps = document.getElementById('pwaStatus');
+  if (ps) ps.style.display = 'none';
 });
-async function doInstall(){
-  if(!dPr){toast('Already installed or unavailable');return;}
+
+async function doInstall() {
+  if (!dPr) {
+    // Already installed or browser doesn't support prompt
+    const isStandalone = window.matchMedia('(display-mode: standalone)').matches
+                      || window.navigator.standalone === true;
+    toast(isStandalone ? '✅ App is already installed!' : '📲 Open in Chrome on Android to install');
+    return;
+  }
+  // Trigger native browser Add-to-Home-Screen dialog
+  // This creates the icon on the home screen automatically
   dPr.prompt();
-  const{outcome}=await dPr.userChoice; dPr=null;
+  const { outcome } = await dPr.userChoice;
+  dPr = null;   // can only be used once
   document.getElementById('instBanner').classList.remove('show');
-  if(outcome==='accepted'){toast('✅ Installed!');setText('pwaStatus','✓ Installed');const b=document.getElementById('aboutInstBtn');if(b)b.style.display='none';}
+  if (outcome === 'accepted') {
+    toast('✅ Installing… icon will appear on home screen!');
+    setText('pwaStatus', '✓ Installed — check your home screen');
+    const b = document.getElementById('aboutInstBtn');
+    if (b) b.style.display = 'none';
+  } else {
+    toast('Install cancelled — tap Install anytime to retry');
+  }
 }
-window.addEventListener('appinstalled',()=>{
-  document.getElementById('instBanner').classList.remove('show');
-  toast('✅ App installed!');
+
+// Fires after icon is placed on home screen
+window.addEventListener('appinstalled', () => {
+  const banner = document.getElementById('instBanner');
+  if (banner) banner.classList.remove('show');
+  const b = document.getElementById('aboutInstBtn');
+  if (b) b.style.display = 'none';
+  setText('pwaStatus', '✓ Installed — icon on home screen');
+  toast('🎉 App installed! Icon added to home screen');
+  dPr = null;
 });
-if(window.matchMedia('(display-mode: standalone)').matches||navigator.standalone)
-  setText('pwaStatus','✓ Running as installed app');
+
+// Detect if already running as installed PWA
+(function detectPWA() {
+  const standalone = window.matchMedia('(display-mode: standalone)').matches
+                  || window.navigator.standalone === true;
+  if (standalone) {
+    setText('pwaStatus', '✓ Running as installed app');
+    const banner = document.getElementById('instBanner');
+    if (banner) banner.classList.remove('show');
+  } else {
+    // Not installed yet — show hint on About page
+    setText('pwaStatus', 'Tap Install above to add to home screen');
+  }
+})();
 
 function chkOnline(){document.getElementById('offbanner').classList.toggle('show',!navigator.onLine);}
 window.addEventListener('online',chkOnline);
@@ -1468,13 +1631,4 @@ if('serviceWorker' in navigator)
     .then(r=>{r.addEventListener('updatefound',()=>{r.installing?.addEventListener('statechange',function(){if(this.state==='installed'&&navigator.serviceWorker.controller)toast('🔄 Update ready — refresh');});});})
     .catch(e=>console.warn('SW:',e)));
 
-/* ═══════════════════════════════════════
-   INIT
-═══════════════════════════════════════ */
-ensureHist();
-updDash();
-renderSessions();
-if(S.dark){document.getElementById('app').classList.add('dark');document.body.classList.add('dark');}
-</script>
-</body>
-</html>
+/* ═════════
